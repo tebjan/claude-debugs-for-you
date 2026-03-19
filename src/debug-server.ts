@@ -19,7 +19,7 @@ export interface DebugCommand {
 }
 
 export interface DebugStep {
-    type: 'setBreakpoint' | 'removeBreakpoint' | 'continue' | 'evaluate' | 'launch' | 'stepOver' | 'stepInto' | 'stepOut' | 'pause' | 'getStackTrace' | 'getVariables';
+    type: 'setBreakpoint' | 'removeBreakpoint' | 'continue' | 'evaluate' | 'launch' | 'stepOver' | 'stepInto' | 'stepOut' | 'pause' | 'getStackTrace' | 'getVariables' | 'getBreakpoints' | 'getThreads' | 'getModules' | 'setVariable' | 'goto';
     file: string;
     line?: number;
     expression?: string;
@@ -32,15 +32,25 @@ interface ToolRequest {
     arguments?: any;
 }
 
-const debugDescription = `Execute a debug plan with breakpoints, stepping, inspection, and expression
-evaluation. ONLY SET BREAKPOINTS BEFORE LAUNCHING OR WHILE PAUSED. Be careful to keep track of where
-you are, if paused on a breakpoint. Make sure to find and get the contents of any requested files.
-Only use continue when ready to move to the next breakpoint. Launch will bring you to the first
-breakpoint. DO NOT USE CONTINUE TO GET TO THE FIRST BREAKPOINT.
-Step types: setBreakpoint, removeBreakpoint, continue, evaluate, launch, stepOver, stepInto, stepOut,
-pause, getStackTrace, getVariables. Stepping commands (stepOver/stepInto/stepOut) wait for the
-debugger to stop and return the new location. getStackTrace returns the full call stack with file
-paths and line numbers. getVariables returns all local variables and their values in the current frame.`;
+const debugDescription = `Full-featured debugger control with breakpoints, stepping, inspection, and expression evaluation.
+ONLY SET BREAKPOINTS BEFORE LAUNCHING OR WHILE PAUSED.
+Only use continue when ready to move to the next breakpoint. Launch will bring you to the first breakpoint.
+DO NOT USE CONTINUE TO GET TO THE FIRST BREAKPOINT.
+
+Step types:
+- setBreakpoint/removeBreakpoint: manage breakpoints (file+line required, optional condition)
+- continue: resume execution (returns immediately)
+- stepOver/stepInto/stepOut: single-step (waits for stop, returns new location)
+- pause: break a running program (returns where it stopped)
+- evaluate: evaluate expression in current frame (use expression field)
+- getStackTrace: full call stack with file paths and line numbers
+- getVariables: all locals/args in current frame with values and types
+- getBreakpoints: list all currently set breakpoints with file, line, condition, enabled state
+- getThreads: list all threads with ID, name, and stopped status
+- getModules: list loaded modules/DLLs with symbol status
+- setVariable: modify a variable value (use expression="name=value")
+- goto: set next statement to a specific line (file+line required, does not execute)
+- launch: start debug session using first launch.json config`;
 
 const listFilesDescription = "List all files in the workspace. Use this to find any requested files.";
 
@@ -58,7 +68,7 @@ const getFileContentInputSchema = {
 };
 
 const debugStepSchema = z.object({
-    type: z.enum(["setBreakpoint", "removeBreakpoint", "continue", "evaluate", "launch", "stepOver", "stepInto", "stepOut", "pause", "getStackTrace", "getVariables"]).describe(""),
+    type: z.enum(["setBreakpoint", "removeBreakpoint", "continue", "evaluate", "launch", "stepOver", "stepInto", "stepOut", "pause", "getStackTrace", "getVariables", "getBreakpoints", "getThreads", "getModules", "setVariable", "goto"]).describe(""),
     file: z.string(),
     line: z.number().optional(),
     expression: z.string().describe("An expression to be evaluated in the stack frame of the current breakpoint").optional(),
@@ -649,6 +659,112 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                         }
                     }
                     results.push(`Variables at ${gvStack.stackFrames[0].name}:\n${allVars.join('\n')}`);
+                    break;
+                }
+
+                case 'getBreakpoints': {
+                    const bps = vscode.debug.breakpoints;
+                    if (bps.length === 0) {
+                        results.push('No breakpoints set');
+                    } else {
+                        const formatted = bps.map((bp, i) => {
+                            if (bp instanceof vscode.SourceBreakpoint) {
+                                const loc = bp.location;
+                                const cond = bp.condition ? ` (condition: ${bp.condition})` : '';
+                                const enabled = bp.enabled ? '' : ' [DISABLED]';
+                                return `#${i} ${loc.uri.fsPath}:${loc.range.start.line + 1}${cond}${enabled}`;
+                            }
+                            return `#${i} (function breakpoint)`;
+                        }).join('\n');
+                        results.push(`Breakpoints (${bps.length}):\n${formatted}`);
+                    }
+                    break;
+                }
+
+                case 'getThreads': {
+                    const { session: gtSession } = await this.getThreadId();
+                    const gtThreads = await gtSession.customRequest('threads');
+                    const formatted = gtThreads.threads.map((t: any) =>
+                        `Thread ${t.id}: ${t.name}`
+                    ).join('\n');
+                    results.push(`Threads (${gtThreads.threads.length}):\n${formatted}`);
+                    break;
+                }
+
+                case 'getModules': {
+                    const { session: gmSession } = await this.getThreadId();
+                    try {
+                        const modules = await gmSession.customRequest('modules', { startModule: 0, moduleCount: 100 });
+                        const formatted = modules.modules.map((m: any) =>
+                            `${m.name}${m.path ? ` (${m.path})` : ''}${m.symbolStatus ? ` [${m.symbolStatus}]` : ''}`
+                        ).join('\n');
+                        results.push(`Loaded modules (${modules.modules.length}):\n${formatted}`);
+                    } catch (err) {
+                        results.push('getModules not supported by this debug adapter');
+                    }
+                    break;
+                }
+
+                case 'setVariable': {
+                    const { session: svSession, threadId: svThreadId } = await this.getThreadId();
+                    if (!step.expression) {
+                        throw new Error('expression required for setVariable (format: "name=value")');
+                    }
+                    const eqIdx = step.expression.indexOf('=');
+                    if (eqIdx === -1) {
+                        throw new Error('expression must be "name=value"');
+                    }
+                    const varName = step.expression.substring(0, eqIdx).trim();
+                    const varValue = step.expression.substring(eqIdx + 1).trim();
+
+                    const svStack = await svSession.customRequest('stackTrace', { threadId: svThreadId, levels: 1 });
+                    const svFrameId = svStack.stackFrames[0].id;
+                    const svScopes = await svSession.customRequest('scopes', { frameId: svFrameId });
+
+                    let set = false;
+                    for (const scope of svScopes.scopes) {
+                        try {
+                            const response = await svSession.customRequest('setVariable', {
+                                variablesReference: scope.variablesReference,
+                                name: varName,
+                                value: varValue,
+                            });
+                            results.push(`Set ${varName} = ${response.value}${response.type ? ` (${response.type})` : ''}`);
+                            set = true;
+                            break;
+                        } catch {
+                            continue;
+                        }
+                    }
+                    if (!set) {
+                        results.push(`ERROR: Could not set variable "${varName}" — not found in any scope`);
+                    }
+                    break;
+                }
+
+                case 'goto': {
+                    const { session: goSession, threadId: goThreadId } = await this.getThreadId();
+                    if (!step.line) {
+                        throw new Error('line required for goto');
+                    }
+                    try {
+                        // Get goto targets for the line
+                        const targets = await goSession.customRequest('gotoTargets', {
+                            source: { path: step.file },
+                            line: step.line,
+                        });
+                        if (targets.targets && targets.targets.length > 0) {
+                            await goSession.customRequest('goto', {
+                                threadId: goThreadId,
+                                targetId: targets.targets[0].id,
+                            });
+                            results.push(`Set next statement to ${step.file}:${step.line}`);
+                        } else {
+                            results.push(`ERROR: No goto target available at line ${step.line}`);
+                        }
+                    } catch (err) {
+                        results.push(`goto not supported by this debug adapter`);
+                    }
                     break;
                 }
 

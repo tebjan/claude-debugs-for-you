@@ -19,7 +19,7 @@ export interface DebugCommand {
 }
 
 export interface DebugStep {
-    type: 'setBreakpoint' | 'removeBreakpoint' | 'continue' | 'evaluate' | 'launch';
+    type: 'setBreakpoint' | 'removeBreakpoint' | 'continue' | 'evaluate' | 'launch' | 'stepOver' | 'stepInto' | 'stepOut' | 'pause' | 'getStackTrace' | 'getVariables';
     file: string;
     line?: number;
     expression?: string;
@@ -32,11 +32,15 @@ interface ToolRequest {
     arguments?: any;
 }
 
-const debugDescription = `Execute a debug plan with breakpoints, launch, continues, and expression 
-evaluation. ONLY SET BREAKPOINTS BEFORE LAUNCHING OR WHILE PAUSED. Be careful to keep track of where 
-you are, if paused on a breakpoint. Make sure to find and get the contents of any requested files. 
-Only use continue when ready to move to the next breakpoint. Launch will bring you to the first 
-breakpoint. DO NOT USE CONTINUE TO GET TO THE FIRST BREAKPOINT.`;
+const debugDescription = `Execute a debug plan with breakpoints, stepping, inspection, and expression
+evaluation. ONLY SET BREAKPOINTS BEFORE LAUNCHING OR WHILE PAUSED. Be careful to keep track of where
+you are, if paused on a breakpoint. Make sure to find and get the contents of any requested files.
+Only use continue when ready to move to the next breakpoint. Launch will bring you to the first
+breakpoint. DO NOT USE CONTINUE TO GET TO THE FIRST BREAKPOINT.
+Step types: setBreakpoint, removeBreakpoint, continue, evaluate, launch, stepOver, stepInto, stepOut,
+pause, getStackTrace, getVariables. Stepping commands (stepOver/stepInto/stepOut) wait for the
+debugger to stop and return the new location. getStackTrace returns the full call stack with file
+paths and line numbers. getVariables returns all local variables and their values in the current frame.`;
 
 const listFilesDescription = "List all files in the workspace. Use this to find any requested files.";
 
@@ -54,7 +58,7 @@ const getFileContentInputSchema = {
 };
 
 const debugStepSchema = z.object({
-    type: z.enum(["setBreakpoint", "removeBreakpoint", "continue", "evaluate", "launch"]).describe(""),
+    type: z.enum(["setBreakpoint", "removeBreakpoint", "continue", "evaluate", "launch", "stepOver", "stepInto", "stepOut", "pause", "getStackTrace", "getVariables"]).describe(""),
     file: z.string(),
     line: z.number().optional(),
     expression: z.string().describe("An expression to be evaluated in the stack frame of the current breakpoint").optional(),
@@ -363,6 +367,32 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         }
     }
 
+    private waitForStopped(timeout: number = 10000): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                disposable.dispose();
+                reject(new Error('Timeout waiting for debugger to stop'));
+            }, timeout);
+
+            const disposable = vscode.debug.onDidChangeActiveStackItem(() => {
+                clearTimeout(timer);
+                disposable.dispose();
+                // Small delay to let VS Code fully update
+                setTimeout(resolve, 50);
+            });
+        });
+    }
+
+    private async getThreadId(): Promise<{ session: vscode.DebugSession; threadId: number }> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            throw new Error('No active debug session');
+        }
+        const threads = await session.customRequest('threads');
+        const threadId = threads.threads[0].id;
+        return { session, threadId };
+    }
+
     private waitForDebugSession(): Promise<vscode.DebugSession> {
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
@@ -523,6 +553,83 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                         }
                         results.push(`ERROR: Evaluation failed for "${step.expression}": ${errorMessage}${stackTrace}`);
                     }
+                    break;
+                }
+
+                case 'stepOver': {
+                    const { session: soSession, threadId: soThreadId } = await this.getThreadId();
+                    const soStoppedPromise = this.waitForStopped();
+                    await soSession.customRequest('next', { threadId: soThreadId });
+                    await soStoppedPromise;
+                    const soStack = await soSession.customRequest('stackTrace', { threadId: soThreadId, levels: 1 });
+                    const soFrame = soStack.stackFrames[0];
+                    results.push(`Stepped over → ${soFrame.source?.name || 'unknown'}:${soFrame.line} (${soFrame.name})`);
+                    break;
+                }
+
+                case 'stepInto': {
+                    const { session: siSession, threadId: siThreadId } = await this.getThreadId();
+                    const siStoppedPromise = this.waitForStopped();
+                    await siSession.customRequest('stepIn', { threadId: siThreadId });
+                    await siStoppedPromise;
+                    const siStack = await siSession.customRequest('stackTrace', { threadId: siThreadId, levels: 1 });
+                    const siFrame = siStack.stackFrames[0];
+                    results.push(`Stepped into → ${siFrame.source?.name || 'unknown'}:${siFrame.line} (${siFrame.name})`);
+                    break;
+                }
+
+                case 'stepOut': {
+                    const { session: soutSession, threadId: soutThreadId } = await this.getThreadId();
+                    const soutStoppedPromise = this.waitForStopped();
+                    await soutSession.customRequest('stepOut', { threadId: soutThreadId });
+                    await soutStoppedPromise;
+                    const soutStack = await soutSession.customRequest('stackTrace', { threadId: soutThreadId, levels: 1 });
+                    const soutFrame = soutStack.stackFrames[0];
+                    results.push(`Stepped out → ${soutFrame.source?.name || 'unknown'}:${soutFrame.line} (${soutFrame.name})`);
+                    break;
+                }
+
+                case 'pause': {
+                    const { session: pauseSession, threadId: pauseThreadId } = await this.getThreadId();
+                    await pauseSession.customRequest('pause', { threadId: pauseThreadId });
+                    // Wait briefly for the debugger to actually pause
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                    const pauseStack = await pauseSession.customRequest('stackTrace', { threadId: pauseThreadId, levels: 1 });
+                    const pauseFrame = pauseStack.stackFrames[0];
+                    results.push(`Paused at ${pauseFrame.source?.name || 'unknown'}:${pauseFrame.line} (${pauseFrame.name})`);
+                    break;
+                }
+
+                case 'getStackTrace': {
+                    const { session: stSession, threadId: stThreadId } = await this.getThreadId();
+                    const stStack = await stSession.customRequest('stackTrace', { threadId: stThreadId, levels: 50 });
+                    const formatted = stStack.stackFrames.map((f: any, i: number) =>
+                        `#${i} ${f.name} at ${f.source?.path || f.source?.name || '<unknown>'}:${f.line}`
+                    ).join('\n');
+                    results.push(`Stack trace (${stStack.stackFrames.length} frames):\n${formatted}`);
+                    break;
+                }
+
+                case 'getVariables': {
+                    const { session: gvSession, threadId: gvThreadId } = await this.getThreadId();
+                    const gvStack = await gvSession.customRequest('stackTrace', { threadId: gvThreadId, levels: 1 });
+                    const gvFrameId = gvStack.stackFrames[0].id;
+                    const gvScopes = await gvSession.customRequest('scopes', { frameId: gvFrameId });
+                    const allVars: string[] = [];
+                    for (const scope of gvScopes.scopes) {
+                        try {
+                            const vars = await gvSession.customRequest('variables', {
+                                variablesReference: scope.variablesReference
+                            });
+                            allVars.push(`--- ${scope.name} ---`);
+                            for (const v of vars.variables) {
+                                allVars.push(`  ${v.name} = ${v.value}${v.type ? ` (${v.type})` : ''}`);
+                            }
+                        } catch (err) {
+                            allVars.push(`--- ${scope.name} --- (error reading)`);
+                        }
+                    }
+                    results.push(`Variables at ${gvStack.stackFrames[0].name}:\n${allVars.join('\n')}`);
                     break;
                 }
 

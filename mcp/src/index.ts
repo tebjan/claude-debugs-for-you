@@ -133,6 +133,7 @@ const debugDescription = `Debug tool with full stepping, inspection, and control
 - getLoadedModules: list loaded DLLs/modules
 - setVariable: modify a variable value (name + value in expression field)
 - goto: jump to a target line (file + line)
+- startDebugging: start a VS Code debug session by config name (pass config name in expression field, or omit to list available configs)
 NEVER chain continue + evaluate in same call. Set breakpoints WHILE PAUSED or before session starts.`;
 
 const listFilesDescription = "List all files in the workspace. Use this to find any requested files.";
@@ -177,7 +178,7 @@ const debugStepSchema = {
                 enum: ["setBreakpoint", "removeBreakpoint", "continue", "evaluate", "launch",
                        "stepOver", "stepInto", "stepOut", "pause",
                        "getStackTrace", "getVariables", "getBreakpoints", "getThreads",
-                       "getLoadedModules", "setVariable", "goto"],
+                       "getLoadedModules", "setVariable", "goto", "startDebugging"],
                 description: ""
             },
             file: { type: "string" },

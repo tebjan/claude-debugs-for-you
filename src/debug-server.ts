@@ -19,7 +19,7 @@ export interface DebugCommand {
 }
 
 export interface DebugStep {
-    type: 'setBreakpoint' | 'removeBreakpoint' | 'continue' | 'evaluate' | 'launch' | 'stepOver' | 'stepInto' | 'stepOut' | 'pause' | 'getStackTrace' | 'getVariables' | 'getBreakpoints' | 'getThreads' | 'getModules' | 'setVariable' | 'goto';
+    type: 'setBreakpoint' | 'removeBreakpoint' | 'continue' | 'evaluate' | 'launch' | 'stepOver' | 'stepInto' | 'stepOut' | 'pause' | 'getStackTrace' | 'getVariables' | 'getBreakpoints' | 'getThreads' | 'getModules' | 'setVariable' | 'goto' | 'startDebugging';
     file: string;
     line?: number;
     expression?: string;
@@ -68,7 +68,7 @@ const getFileContentInputSchema = {
 };
 
 const debugStepSchema = z.object({
-    type: z.enum(["setBreakpoint", "removeBreakpoint", "continue", "evaluate", "launch", "stepOver", "stepInto", "stepOut", "pause", "getStackTrace", "getVariables", "getBreakpoints", "getThreads", "getModules", "setVariable", "goto"]).describe(""),
+    type: z.enum(["setBreakpoint", "removeBreakpoint", "continue", "evaluate", "launch", "stepOver", "stepInto", "stepOut", "pause", "getStackTrace", "getVariables", "getBreakpoints", "getThreads", "getModules", "setVariable", "goto", "startDebugging"]).describe(""),
     file: z.string(),
     line: z.number().optional(),
     expression: z.string().describe("An expression to be evaluated in the stack frame of the current breakpoint").optional(),
@@ -770,6 +770,64 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
 
                 case 'launch': {
                     await this.handleLaunch({ program: step.file });
+                    break;
+                }
+
+                case 'startDebugging': {
+                    const configName = step.expression; // config name from launch.json
+                    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+                    if (!workspaceFolder) {
+                        results.push('ERROR: No workspace folder found');
+                        break;
+                    }
+
+                    // Stop any existing debug session first
+                    const existingSession = vscode.debug.activeDebugSession;
+                    if (existingSession) {
+                        await vscode.debug.stopDebugging(existingSession);
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                    }
+
+                    if (configName) {
+                        // Find the named configuration in launch.json
+                        const launchConfig = vscode.workspace.getConfiguration('launch', workspaceFolder.uri);
+                        const configurations = launchConfig.get<any[]>('configurations') || [];
+                        const config = configurations.find(c => c.name === configName);
+                        if (!config) {
+                            const names = configurations.map(c => c.name).join(', ');
+                            results.push(`ERROR: Configuration "${configName}" not found. Available: ${names}`);
+                            break;
+                        }
+                        await vscode.debug.startDebugging(workspaceFolder, config);
+                    } else {
+                        // No config name — list available configurations
+                        const launchConfig = vscode.workspace.getConfiguration('launch', workspaceFolder.uri);
+                        const configurations = launchConfig.get<any[]>('configurations') || [];
+                        const names = configurations.map(c => `${c.name} (${c.type}/${c.request})`).join(', ');
+                        results.push(`Available configurations: ${names}`);
+                        break;
+                    }
+
+                    // Wait for session to become active
+                    const newSession = await this.waitForDebugSession();
+                    if (newSession) {
+                        results.push(`Started debugging with "${configName}". Session active.`);
+                        // Check if paused at a breakpoint
+                        try {
+                            const threads = await newSession.customRequest('threads');
+                            const threadId = threads?.threads?.[0]?.id;
+                            if (threadId) {
+                                const stack = await newSession.customRequest('stackTrace', { threadId });
+                                if (stack.stackFrames?.length > 0) {
+                                    const frame = stack.stackFrames[0];
+                                    results.push(`Paused at ${frame.source?.path || '?'}:${frame.line} (${frame.name})`);
+                                }
+                            }
+                        } catch { /* running, not paused */ }
+                    } else {
+                        results.push(`Started debugging with "${configName}" but session not yet active.`);
+                    }
+                    break;
                 }
             }
         }
